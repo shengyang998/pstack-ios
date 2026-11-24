@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""Local two-channel test peer. JSON control + length-prefixed PNG video. See references/virtual-devices.md."""
+import asyncio
+import json
+import struct
+import sys
+import zlib
+
+
+def line(value):
+    return (json.dumps(value, separators=(",", ":")) + "\n").encode()
+
+
+def png_frame(mode, sequence):
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
+
+    value = 32 + sequence % 200
+    pixel = bytes([value] * 3 if mode == "mono" else [value, 20, 230])
+    header = struct.pack(">IIBBBBB", 32, 16, 8, 2, 0, 0, 0)
+    rows = (b"\0" + pixel * 32) * 16
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header)
+            + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+
+
+class Camera:
+    def __init__(self):
+        self.mode = "color"
+        self.sequence = 0
+        self.applied = {}
+        self.drop_next_ack = False
+        self.pause_video = False
+        self.peers = {"control": set(), "video": set()}
+
+    def state(self):
+        return {"mode": self.mode, "sequence": self.sequence, "appliedCount": len(self.applied)}
+
+    def request(self, request):
+        if not isinstance(request, dict):
+            raise ValueError("expected a request object")
+        request_id = request.get("id")
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError("expected a nonempty string id")
+        op = request.get("op")
+        if op == "get":
+            return {"id": request_id, "mode": self.mode, "sequence": self.sequence}
+        mode = request.get("mode")
+        if op != "setMode" or mode not in ("color", "mono"):
+            raise ValueError("expected get or setMode with color/mono")
+        if request_id in self.applied:
+            if self.applied[request_id] != mode:
+                raise ValueError("id reused for a different operation")
+        else:
+            self.mode = mode
+            self.applied[request_id] = mode
+        if self.drop_next_ack:
+            self.drop_next_ack = False
+            return None
+        return {"id": request_id, "appliedMode": mode}
+
+    async def peer(self, channel, reader, writer):
+        self.peers[channel].add(writer)
+        try:
+            if channel == "video":
+                await reader.read(1)  # This stream is device-to-client only.
+                return
+            while packet := await reader.readline():
+                try:
+                    response = self.request(json.loads(packet))
+                except (ValueError, UnicodeError) as error:
+                    response = {"error": str(error)}
+                if response is not None:
+                    writer.write(line(response))
+                    await writer.drain()
+        except (ConnectionError, ValueError):
+            pass  # A disconnected client may reconnect without resetting the device.
+        finally:
+            self.peers[channel].discard(writer)
+            writer.close()
+
+    async def broadcast(self, channel, data):
+        for writer in list(self.peers[channel]):
+            try:
+                writer.write(data)
+                await asyncio.wait_for(writer.drain(), timeout=1)
+            except (ConnectionError, asyncio.TimeoutError):
+                self.peers[channel].discard(writer)
+                writer.close()
+
+    async def drive(self, op):
+        if op == "dropNextAck":
+            self.drop_next_ack = True
+        elif op == "cutControl":
+            for writer in list(self.peers["control"]):
+                writer.close()
+        elif op in ("pauseVideo", "resumeVideo"):
+            self.pause_video = op == "pauseVideo"
+        elif op == "tick":
+            self.sequence += 1
+            if not self.pause_video:
+                image = png_frame(self.mode, self.sequence)
+                await self.broadcast("video", struct.pack(">II", self.sequence, len(image)) + image)
+        elif op == "notify":
+            await self.broadcast("control", line({"event": "state", "mode": self.mode, "sequence": self.sequence}))
+        elif op != "inspect":
+            raise ValueError("unknown driver operation")
+        return {**self.state(), "clients": {key: len(peers) for key, peers in self.peers.items()}}
+
+
+async def serve():
+    camera = Camera()
+    servers = {}
+    for channel in camera.peers:
+        async def connect(reader, writer, name=channel):
+            await camera.peer(name, reader, writer)
+
+        servers[channel] = await asyncio.start_server(connect, "127.0.0.1", 0)
+    ports = {name: s.sockets[0].getsockname()[1] for name, s in servers.items()}
+    print(json.dumps({"host": "127.0.0.1", **ports}), flush=True)
+    try:
+        while raw := await asyncio.to_thread(sys.stdin.readline):
+            try:
+                op = json.loads(raw)["op"]
+                if op == "quit":
+                    break
+                report = await camera.drive(op)
+            except (ValueError, TypeError, KeyError) as error:
+                report = {"error": str(error)}
+            print(json.dumps(report), flush=True)
+    finally:
+        for server in servers.values():
+            server.close()
+            await server.wait_closed()
+        for peers in camera.peers.values():
+            for writer in peers:
+                writer.close()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 1:
+        print(__doc__)
+        sys.exit(0 if sys.argv[1:] in (["-h"], ["--help"]) else 2)
+    try:
+        asyncio.run(serve())
+    except KeyboardInterrupt:
+        pass

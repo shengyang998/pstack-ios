@@ -1,0 +1,4 @@
+interface:
+  display_name: "pstack iOS"
+  short_description: "Build, test and verify iOS changes with Xcode"
+  default_prompt: "Use $pstack-ios to reproduce this iOS issue and verify the fix on the affected screen."

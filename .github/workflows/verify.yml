@@ -1,0 +1,33 @@
+name: Verify the Codex skill
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test CLI behavior
+        run: python3 -m unittest discover -s tests
+      - name: Exercise a generated app on iOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cli=skills/pstack-ios/scripts/pstack-ios
+          sim_id=$("$cli" devices | python3 -c 'import json,sys; print(next(d["udid"] for d in json.load(sys.stdin) if d["deviceTypeIdentifier"].split(".")[-1].startswith("iPhone-")))')
+          tests/simulator-smoke.sh "$sim_id" "$RUNNER_TEMP/pstack-smoke"
+          tests/interface-ui-smoke.sh "$sim_id" "$RUNNER_TEMP/pstack-interface"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: simulator-evidence
+          path: |
+            ${{ runner.temp }}/pstack-interface/summary.json
+            ${{ runner.temp }}/pstack-interface/results/**/*.xcresult
+            ${{ runner.temp }}/pstack-smoke/summary.json
+            ${{ runner.temp }}/pstack-smoke/test/**/*.xcresult
+            ${{ runner.temp }}/pstack-smoke/run/**/*.xcresult
+            ${{ runner.temp }}/pstack-smoke/screens/**/*.png
+            ${{ runner.temp }}/pstack-smoke/archive/**/*.xcresult
+          if-no-files-found: warn

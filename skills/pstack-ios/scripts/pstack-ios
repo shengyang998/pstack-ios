@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Drive Apple's iOS tools from a Codex skill. Requires Python 3.9+."""
+import argparse
+import json
+from pathlib import Path
+import plistlib
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+def call(args, *, cwd=None, capture=False):
+    args = [str(arg) for arg in args]
+    print("+", shlex.join(args), file=sys.stderr, flush=True)
+    return subprocess.run(args, cwd=cwd, check=True, text=True,
+                          stdout=subprocess.PIPE if capture else None).stdout
+
+
+def json_call(args, cwd=None):
+    return json.loads(call(args, cwd=cwd, capture=True))
+
+
+def simulators():
+    groups = json_call(["xcrun", "simctl", "list", "devices", "available", "--json"])["devices"]
+    return [{**device, "runtime": runtime} for runtime, devices in groups.items()
+            if runtime.startswith("com.apple.CoreSimulator.SimRuntime.iOS-")
+            for device in devices if device.get("isAvailable")]
+
+
+def device_for(udid):
+    for device in simulators():
+        if device["udid"].lower() == udid.lower():
+            return device
+    raise ValueError("Select an available iOS simulator UDID from the devices command.")
+
+
+def project_context(selected):
+    if selected:
+        path = Path(selected).resolve()
+    else:
+        here = Path.cwd()
+        candidates = sorted(here.glob("*.xcworkspace")) + sorted(here.glob("*.xcodeproj"))
+        if (here / "Package.swift").is_file():
+            candidates.append(here / "Package.swift")
+        if len(candidates) != 1:
+            choices = ", ".join(p.name for p in candidates) or "none in this directory"
+            raise ValueError(f"Select --container from the project or CI configuration ({choices}).")
+        path = candidates[0]
+    if path.is_dir() and (path / "Package.swift").is_file() and path.suffix not in (".xcodeproj", ".xcworkspace"):
+        path = path / "Package.swift"
+    if path.is_file() and path.name == "Package.swift":
+        root = path.parent
+        if any(root.glob("*.xcodeproj")) or any(root.glob("*.xcworkspace")):
+            # Xcode recognizes this native SwiftPM workspace by location. A bare
+            # xcodebuild in a mixed directory silently selects its neighboring app.
+            workspace = root / ".swiftpm/xcode/package.xcworkspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+            return root, ["-workspace", workspace]
+        return root, []
+    if path.is_dir() and path.suffix in (".xcodeproj", ".xcworkspace"):
+        flag = "-project" if path.suffix == ".xcodeproj" else "-workspace"
+        return path.parent, [flag, path]
+    raise ValueError("Expected an existing .xcworkspace, .xcodeproj, or Package.swift.")
+
+
+def new_app(args):
+    if not re.fullmatch(r"[A-Z][A-Za-z0-9]*", args.name):
+        raise ValueError("Use an ASCII project name starting with an uppercase letter, e.g. TrailNotes.")
+    if not re.fullmatch(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", args.bundle_id):
+        raise ValueError("Use a reverse-DNS bundle identifier, e.g. org.example.trailnotes.")
+    source = Path(__file__).resolve().parent.parent / "assets" / "starter"
+    output = Path(args.output).absolute()
+    output.mkdir(parents=True, exist_ok=False)
+    try:
+        for path in sorted(source.rglob("*")):
+            relative = str(path.relative_to(source)).replace("PStackStarter", args.name)
+            dest = output / relative
+            if path.is_dir():
+                dest.mkdir()
+            else:
+                content = path.read_text().replace("PStackStarter", args.name)
+                dest.write_text(content.replace("org.example.pstackstarter", args.bundle_id))
+    except Exception:
+        shutil.rmtree(output)
+        raise
+    print(output / f"{args.name}.xcodeproj")
+
+
+def results(bundle):
+    summary = json_call(["xcrun", "xcresulttool", "get", "test-results", "summary", "--path", bundle])
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    if summary["result"] != "Passed" or summary["failedTests"] or summary["passedTests"] < 1:
+        raise ValueError("The result bundle does not show a passing test run.")
+
+
+def output_dir(parent):
+    if parent:
+        parent = Path(parent).resolve()
+        parent.mkdir(parents=True, exist_ok=True)
+    output = Path(tempfile.mkdtemp(prefix="pstack-ios-", dir=parent))
+    print(f"Artifacts: {output}", file=sys.stderr, flush=True)
+    return output
+
+
+def export_archive(args):
+    archive = args.archive.resolve()
+    if not (archive / "Info.plist").is_file():
+        raise ValueError("Expected an existing .xcarchive with Info.plist.")
+    options = args.options.resolve()
+    with options.open("rb") as file:
+        settings = plistlib.load(file)
+    if not isinstance(settings, dict) or settings.get("destination", "export") != "export":
+        raise ValueError("Local export requires ExportOptions.plist destination 'export'.")
+    output = output_dir(args.artifacts)
+    call(["xcodebuild", "-exportArchive", "-archivePath", archive, "-exportPath", output,
+          "-exportOptionsPlist", options])
+    print(output)
+
+
+def install_and_launch(command, cwd, device, target):
+    entries = json_call(command + ["-showBuildSettings", "-json"], cwd)
+    apps = [entry["buildSettings"] for entry in entries
+            if entry["buildSettings"].get("PRODUCT_TYPE") == "com.apple.product-type.application"
+            and (not target or entry.get("target") == target)]
+    if len(apps) != 1:
+        raise ValueError("Select the runnable application with --app-target. Check the scheme's Build action.")
+    app = Path(apps[0]["TARGET_BUILD_DIR"]) / apps[0]["FULL_PRODUCT_NAME"]
+    with (app / "Info.plist").open("rb") as file:
+        bundle_id = plistlib.load(file)["CFBundleIdentifier"]
+    call(["xcrun", "simctl", "bootstatus", device, "-b"])
+    call(["xcrun", "simctl", "install", device, app])
+    call(["xcrun", "simctl", "launch", "--terminate-running-process", device, bundle_id])
+
+
+def xcode_action(args, cwd, selector):
+    command = ["xcodebuild", *selector]
+    if args.action == "inspect":
+        call(command + ["-list", "-json"], cwd=cwd)
+        return
+    command += ["-scheme", args.scheme]
+    if args.action == "destinations":
+        call(command + ["-showdestinations"], cwd=cwd)
+        return
+    if args.configuration:
+        command += ["-configuration", args.configuration]
+    if args.derived_data:
+        command += ["-derivedDataPath", Path(args.derived_data).resolve()]
+    if args.action == "archive":
+        destination = "generic/platform=iOS"
+    else:
+        device = device_for(args.device)["udid"]
+        destination = f"platform=iOS Simulator,id={device}"
+    command += ["-destination", destination]
+    output = output_dir(args.artifacts)
+    bundle = output / f"{args.action}.xcresult"
+    action = args.action
+    options = ["-resultBundlePath", bundle]
+    if action == "test":
+        if args.plan:
+            options += ["-testPlan", args.plan]
+        options += ["-only-testing:" + case for case in args.only]
+        if args.serial:
+            options += ["-parallel-testing-enabled", "NO"]
+    elif action == "archive":
+        options += ["-archivePath", output / "App.xcarchive"]
+        if args.unsigned:
+            options += ["CODE_SIGNING_ALLOWED=NO"]
+    elif action == "run":
+        action = "build"
+    call(command + options + [action], cwd=cwd)
+    if args.action == "test":
+        results(bundle)
+    elif args.action == "run":
+        install_and_launch(command, cwd, device, args.app_target)
+    elif args.action == "archive":
+        archive = output / "App.xcarchive"
+        with (archive / "Info.plist").open("rb") as file:
+            info = plistlib.load(file)
+        app_path = info.get("ApplicationProperties", {}).get("ApplicationPath")
+        if not app_path or not (archive / "Products" / app_path / "Info.plist").is_file():
+            raise ValueError(f"No iOS application product found in {archive}. Check archive scheme and SKIP_INSTALL.")
+        print(archive)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    subs = parser.add_subparsers(dest="action", required=True)
+    subs.add_parser("doctor", help="check active Xcode, SDK, result tools and installed iOS simulators")
+    subs.add_parser("devices", help="list available iOS simulator UDIDs")
+    new = subs.add_parser("new", help="create a SwiftUI project with unit and UI tests")
+    for key in ("name", "bundle-id", "output"):
+        new.add_argument("--" + key, required=True)
+    summary = subs.add_parser("results", help="read a test xcresult and check its verdict")
+    summary.add_argument("bundle", type=Path)
+    export = subs.add_parser("export", help="locally export a signed archive with the project's options plist")
+    export.add_argument("--archive", type=Path, required=True)
+    export.add_argument("--options", type=Path, required=True)
+    export.add_argument("--artifacts", type=Path)
+    capture = subs.add_parser("capture", help="save the screen of a booted iOS simulator")
+    capture.add_argument("--device", required=True)
+    capture.add_argument("--artifacts", type=Path)
+    for action in ("inspect", "destinations", "build", "test", "run", "archive"):
+        sub = subs.add_parser(action)
+        sub.add_argument("--container", help="workspace, project or Package.swift (default: unique in cwd)")
+        if action != "inspect":
+            sub.add_argument("--scheme", required=True)
+        if action in ("inspect", "destinations"):
+            continue
+        sub.add_argument("--configuration", help="use this build configuration instead of the scheme default")
+        sub.add_argument("--derived-data", help="explicit DerivedData directory")
+        sub.add_argument("--artifacts", help="parent for a unique result directory (default: system temp)")
+        if action != "archive":
+            sub.add_argument("--device", required=True, help="iOS simulator UDID")
+        if action == "run":
+            sub.add_argument("--app-target", help="choose among multiple application targets")
+        if action == "test":
+            sub.add_argument("--plan", help="test plan name")
+            sub.add_argument("--only", action="append", default=[], help="Target[/Suite[/testMethod]] (repeatable)")
+            sub.add_argument("--serial", action="store_true", help="disable parallel test workers")
+        if action == "archive":
+            sub.add_argument("--unsigned", action="store_true", help="compile/archive only, without signing")
+    args = parser.parse_args()
+    if args.action == "new":
+        new_app(args)
+    elif args.action == "doctor":
+        call(["xcodebuild", "-version"])
+        call(["xcrun", "--sdk", "iphoneos", "--show-sdk-version"])
+        call(["xcrun", "--sdk", "iphonesimulator", "--show-sdk-version"])
+        call(["xcrun", "xcresulttool", "get", "test-results", "summary", "--help"], capture=True)
+        devices = simulators()
+        if not devices:
+            raise ValueError("Install an iOS Simulator runtime in Xcode Settings > Components and create a simulator.")
+        print(f"{len(devices)} available iOS simulator(s).")
+    elif args.action == "devices":
+        print(json.dumps(simulators(), indent=2))
+    elif args.action == "results":
+        results(args.bundle.resolve())
+    elif args.action == "export":
+        export_archive(args)
+    elif args.action == "capture":
+        device = device_for(args.device)
+        if device["state"] != "Booted":
+            raise ValueError("Launch the desired UI on the simulator before capturing it.")
+        path = output_dir(args.artifacts) / "screen.png"
+        call(["xcrun", "simctl", "io", device["udid"], "screenshot", path])
+        print(path)
+    else:
+        xcode_action(args, *project_context(args.container))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except subprocess.CalledProcessError as error:
+        sys.exit(error.returncode if error.returncode > 0 else 128 - error.returncode)
+    except (OSError, ValueError, KeyError, plistlib.InvalidFileException) as error:
+        sys.exit(f"pstack-ios: {error}")
